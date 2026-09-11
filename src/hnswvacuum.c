@@ -375,12 +375,23 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 /*
  * Repair graph for all elements
  */
+static inline int
+cmp_item_pointers(const void *a, const void *b)
+{
+	ItemPointer ip1 = (ItemPointer) a;
+	ItemPointer ip2 = (ItemPointer) b;
+	return ItemPointerCompare(ip1, ip2);
+}
+
 static void
 RepairGraph(HnswVacuumState * vacuumstate)
 {
 	Relation	index = vacuumstate->index;
 	BufferAccessStrategy bas = vacuumstate->bas;
 	BlockNumber blkno = HNSW_HEAD_BLKNO;
+	uint32		numDeleted = vacuumstate->deleting->members;
+	ItemPointerData *deletedNeighbors = palloc(Max(numDeleted, 1) * sizeof(ItemPointerData));
+	uint32		numDeletedNeighbors = 0;
 
 	/*
 	 * Wait for inserts to complete. Inserts before this point may have
@@ -425,9 +436,16 @@ RepairGraph(HnswVacuumState * vacuumstate)
 			if (etup->deleted)
 				continue;
 
-			/* Skip updating neighbors if being deleted */
+			/* Skip updating neighbors if being deleted; we keep track of deletedNeighbors to remove edges later */
 			if (!ItemPointerIsValid(&etup->heaptids[0]))
+			{
+				/* Only consider elements that are to be deleted, but not deleted yet.*/
+				if (etup->deleted == 0) {
+					Assert(numDeletedNeighbors < numDeleted);
+					deletedNeighbors[numDeletedNeighbors++] = etup->neighbortid;
+				}
 				continue;
+			}
 
 			/* Create an element */
 			element = HnswInitElementFromBlock(blkno, offno);
@@ -499,6 +517,69 @@ RepairGraph(HnswVacuumState * vacuumstate)
 		}
 #endif
 	}
+
+	/*
+	 * Currently, remove heap tids, also inserts deleted elements' tids into
+	 * tid_hash which maybe concurrently occupied, therefore, the number of
+	 * deleted neighbors will be less than or equal to total deleted elements,
+	 * as `numDeletedNeighbors` is only incremented for elements with valid
+	 * neighbor tids (i.e. non-deleted elements).
+	 */
+	Assert(numDeletedNeighbors <= numDeleted);
+
+	if (numDeletedNeighbors > 0)
+	{
+		BlockNumber last_blkno = InvalidBlockNumber;
+		Buffer		nbuf = InvalidBuffer;
+		GenericXLogState *state = NULL;
+		Page		npage = NULL;
+
+		/* Sort the deleted neighbors to avoid repeated page reads */
+		qsort(deletedNeighbors, numDeletedNeighbors, sizeof(ItemPointerData), cmp_item_pointers);
+
+		for (int i = 0; i < numDeletedNeighbors; i++)
+		{
+			ItemPointer neighbortid = &deletedNeighbors[i];
+			HnswNeighborTuple ntup;
+			BlockNumber current_blkno;
+
+			Assert(ItemPointerIsValid(neighbortid));
+
+			current_blkno = ItemPointerGetBlockNumber(neighbortid);
+
+			if (current_blkno != last_blkno)
+			{
+				if (BufferIsValid(nbuf))
+				{
+					GenericXLogFinish(state);
+					UnlockReleaseBuffer(nbuf);
+				}
+
+				nbuf = ReadBufferExtended(index, MAIN_FORKNUM, current_blkno, RBM_NORMAL, bas);
+				LockBuffer(nbuf, BUFFER_LOCK_EXCLUSIVE);
+				state = GenericXLogStart(index);
+				npage = GenericXLogRegisterBuffer(state, nbuf, 0);
+				last_blkno = current_blkno;
+			}
+
+			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, ItemPointerGetOffsetNumber(neighbortid)));
+
+			for (int j = 0; j < ntup->count; j++)
+				ItemPointerSetInvalid(&ntup->indextids[j]);
+
+			ntup->version++;
+			if (ntup->version > 15)
+				ntup->version = 1;
+		}
+
+		if (BufferIsValid(nbuf))
+		{
+			GenericXLogFinish(state);
+			UnlockReleaseBuffer(nbuf);
+		}
+	}
+
+	pfree(deletedNeighbors);
 }
 
 /*
@@ -640,11 +721,6 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 		for (offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
 		{
 			HnswElementTuple etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
-			HnswNeighborTuple ntup;
-			Buffer		nbuf;
-			Page		npage;
-			BlockNumber neighborPage;
-			OffsetNumber neighborOffno;
 
 			/* Skip neighbor tuples */
 			if (!HnswIsElementTuple(etup))
@@ -664,32 +740,12 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			if (ItemPointerIsValid(&etup->heaptids[0]))
 				continue;
 
-			/* Get neighbor page */
-			neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
-			neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
-
-			if (neighborPage == blkno)
-			{
-				nbuf = buf;
-				npage = page;
-			}
-			else
-			{
-				nbuf = ReadBufferExtended(index, MAIN_FORKNUM, neighborPage, RBM_NORMAL, bas);
-				LockBuffer(nbuf, BUFFER_LOCK_EXCLUSIVE);
-				npage = GenericXLogRegisterBuffer(state, nbuf, 0);
-			}
-
-			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, neighborOffno));
 
 			/* Overwrite element */
 			/* Use memset instead of MemSet to keep clang-tidy happy */
 			etup->deleted = 1;
 			memset(&etup->data, 0, VARSIZE_ANY(&etup->data));
 
-			/* Overwrite neighbors */
-			for (int i = 0; i < ntup->count; i++)
-				ItemPointerSetInvalid(&ntup->indextids[i]);
 
 			/* Increment version */
 			/* This is used to avoid incorrect reads for iterative scans */
@@ -697,7 +753,33 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			etup->version++;
 			if (etup->version > 15)
 				etup->version = 1;
-			ntup->version = etup->version;
+
+#ifdef USE_ASSERT_CHECKING
+			Buffer		nbuf = InvalidBuffer;
+			Page		npage;
+			HnswNeighborTuple ntup;
+
+			Assert(ItemPointerIsValid(&etup->neighbortid));
+
+			if (ItemPointerGetBlockNumber(&etup->neighbortid) == blkno)
+				npage = page;
+			else
+			{
+				nbuf = ReadBufferExtended(index, MAIN_FORKNUM, ItemPointerGetBlockNumber(&etup->neighbortid), RBM_NORMAL, bas);
+				LockBuffer(nbuf, BUFFER_LOCK_SHARE);
+				npage = BufferGetPage(nbuf);
+			}
+
+			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, ItemPointerGetOffsetNumber(&etup->neighbortid)));
+
+			for (int j = 0; j < ntup->count; j++)
+				Assert(!ItemPointerIsValid(&ntup->indextids[j]));
+
+			Assert(etup->version == ntup->version);
+
+			if (BufferIsValid(nbuf))
+				UnlockReleaseBuffer(nbuf);
+#endif
 
 			/*
 			 * We modified the tuples in place, no need to call
@@ -706,8 +788,6 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 			/* Commit */
 			GenericXLogFinish(state);
-			if (nbuf != buf)
-				UnlockReleaseBuffer(nbuf);
 
 			/* Set to first free page */
 			if (!BlockNumberIsValid(insertPage))
