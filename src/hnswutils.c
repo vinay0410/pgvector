@@ -4,6 +4,7 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/xlog.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
@@ -548,7 +549,21 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Assert(HnswIsElementTuple(etup));
 
 	if (unlikely(etup->deleted))
+	{
+		/*
+		 * Vacuum waits for in-flight scans before marking elements as
+		 * deleted, but the lock is not WAL-logged, so scans on standbys can
+		 * load elements after they are marked as deleted. Report this like
+		 * other recovery conflicts so the query can be retried.
+		 */
+		if (RecoveryInProgress())
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("canceling statement due to conflict with recovery"),
+					 errdetail("User query might have needed to see index elements that were removed.")));
+
 		elog(ERROR, "cannot load deleted element");
+	}
 
 	/* Calculate distance */
 	if (distance != NULL)

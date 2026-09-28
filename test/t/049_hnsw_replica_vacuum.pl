@@ -45,9 +45,12 @@ PostgreSQL::Test::Utils::append_to_file($script,
 	"SET hnsw.ef_search = 1000;\n"
 	  . "SELECT i FROM tst ORDER BY v <-> (SELECT ARRAY[$array_sql]::vector) LIMIT 10;\n");
 my ($stdout, $stderr) = ('', '');
+# Retry serialization failures (Postgres 15+)
+my $retries = $node_replica->safe_psql("postgres", "SHOW server_version_num") >= 150000;
 my $h = IPC::Run::start(
 	[
 		'pgbench', '--no-vacuum', '--client=16', '--time=10',
+		($retries ? ('--max-tries=10') : ()),
 		'--file=' . $script, '--host=' . $node_replica->host,
 		'--port=' . $node_replica->port, 'postgres'
 	],
@@ -68,7 +71,9 @@ while ($h->pumpable)
 }
 $h->finish;
 
-unlike($stderr, qr/cannot load deleted element/, "standby scans do not load deleted elements");
-is($h->result(0), 0, "pgbench on standby succeeds");
+# Scans may be canceled like other recovery conflicts, but must not fail otherwise
+unlike($stderr, qr/ERROR:  (?!canceling statement due to conflict with recovery)/,
+	"standby scans only fail with recovery conflicts");
+is($h->result(0), 0, "pgbench on standby succeeds with retries") if $retries;
 
 done_testing();
